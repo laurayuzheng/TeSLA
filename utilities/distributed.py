@@ -90,6 +90,7 @@ def init_distributed_mode(args):
         rank=args.rank,
     )
 
+    print("Using GPU: %d" % args.gpu)
     torch.cuda.set_device(args.gpu)
     print('| distributed init (rank {}): {}'.format(
         args.rank, args.dist_url), flush=True)

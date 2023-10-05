@@ -15,12 +15,13 @@ from loguru import logger
 from tqdm import tqdm
 
 import dataloaders.segmentation.mr_segmentation as mr_seg_dataset
-import dataloaders.segmentation.visda.cityscapes as rgb_seg_dataset
+import dataloaders.segmentation.visda.cityscapes as rgb_seg_dataset 
+import dataloaders.segmentation.visda.gta5 as rgb_seg_source_dataset
 from networks.segmentation.unet import UNet
 from networks.segmentation.deeplabv3 import get_deeplab_v3, DeepLabEncapsulator
 from networks.augmentation.segoptaug import SegOptAug, RefinedPseudoLabels
 
-from losses.seg_losses import EntropyClassMarginals, EntropyLoss
+from losses.seg_losses import EntropyClassMarginals, EntropyLoss, SCELoss
 
 from utilities.utils import ensure_dir, normalize_fn, denormalize_fn, load_segmentation_source_model, overlay_segs, clip_gradient, getcolorsegs
 from utilities.metric_tracker import MetricTracker
@@ -72,9 +73,10 @@ class TeSLA_Seg(object):
         
         self.orig_state_dict = deepcopy(self.net.state_dict())
         # load source model
-        load_segmentation_source_model(self.net, opt.pretrained_source_path)
-        
 
+        if self.opt.pretrain == False:
+            load_segmentation_source_model(self.net, opt.pretrained_source_path)
+        
         # freeze last layer of the model
         self.set_parameters(self.net)
 
@@ -109,15 +111,25 @@ class TeSLA_Seg(object):
                 self.target_eval_dataset = mr_seg_dataset.TestTimeDataset(self.opt.target_data_path, self.opt.target_sites, self.opt.dataset_name)
         
         elif opt.dataset_type == "rgb":
-            self.target_dataset = rgb_seg_dataset.CityscapesDataSet(root=self.opt.target_data_path,
+
+            if opt.pretrain: 
+                self.target_dataset = rgb_seg_source_dataset.GTA5DataSet(root=self.opt.target_data_path,
                                                                     list_path=self.opt.target_list_path,
-                                                                    set="train",
-                                                                    info_path=self.opt.target_info_path,
+                                                                    set="all",
                                                                     crop_size=opt.target_input_size,
                                                                     mean=(0.485, 0.456, 0.406),
                                                                     std=(0.229, 0.224, 0.225))
+                self.target_eval_dataset = None 
+            else:
+                self.target_dataset = rgb_seg_dataset.CityscapesDataSet(root=self.opt.target_data_path,
+                                                                        list_path=self.opt.target_list_path,
+                                                                        set="train",
+                                                                        info_path=self.opt.target_info_path,
+                                                                        crop_size=opt.target_input_size,
+                                                                        mean=(0.485, 0.456, 0.406),
+                                                                        std=(0.229, 0.224, 0.225))
 
-            self.target_eval_dataset = rgb_seg_dataset.CityscapesDataSet(root=self.opt.target_data_path,
+                self.target_eval_dataset = rgb_seg_dataset.CityscapesDataSet(root=self.opt.target_data_path,
                                                                          list_path=self.opt.target_eval_list_path,
                                                                          set="val",
                                                                          info_path=self.opt.target_info_path,
@@ -126,10 +138,10 @@ class TeSLA_Seg(object):
                                                                          std=(0.229, 0.224, 0.225))
         
         
-        sampler_eval= DistributedEvalSampler(self.target_eval_dataset, shuffle=False) if self.opt.dist else None
+        # sampler_eval= DistributedEvalSampler(self.target_eval_dataset, shuffle=False) if self.opt.dist else None
         
-        self.target_eval_loader = data.DataLoader(self.target_eval_dataset, batch_size=self.opt.batch_size, sampler=sampler_eval,
-                                                    shuffle=False, drop_last=False, num_workers=2*self.opt.num_workers)
+        # self.target_eval_loader = data.DataLoader(self.target_eval_dataset, batch_size=self.opt.batch_size, sampler=sampler_eval,
+        #                                             shuffle=False, drop_last=False, num_workers=2*self.opt.num_workers)
 
         shuffle = False if self.opt.n_epochs == 1 else True
         sampler = DistributedSampler(self.target_dataset, shuffle=shuffle) if self.opt.dist else None
@@ -155,7 +167,7 @@ class TeSLA_Seg(object):
             self.hard_opt_aug = model_to_DDP(self.hard_opt_aug, opt.gpu).module
 
         # losses
-        self.crterian_cm = EntropyClassMarginals()
+        self.crterian_cm = EntropyClassMarginals() if self.opt.pretrain == False else EntropyLoss()
 
         # optimizer
         self.optimizer_net = torch.optim.AdamW(self.net.parameters(), lr=self.opt.lr, weight_decay=5e-4)
@@ -167,8 +179,14 @@ class TeSLA_Seg(object):
             self.metric_seg = torchmetrics.Dice(num_classes=self.opt.n_classes, average=None, ignore_index=0).cuda()
             self.metric_seg_online = torchmetrics.Dice(num_classes=self.opt.n_classes, average=None, ignore_index=0).cuda()
         else:
-            self.metric_seg = torchmetrics.JaccardIndex(num_classes=self.opt.n_classes + 1, average="none", ignore_index=self.opt.n_classes).cuda()
-            self.metric_seg_online = torchmetrics.JaccardIndex(num_classes=self.opt.n_classes + 1, average="none", ignore_index=self.opt.n_classes).cuda()
+            self.metric_seg = torchmetrics.JaccardIndex(num_classes=self.opt.n_classes + 1, 
+                                                        average="none", 
+                                                        ignore_index=self.opt.n_classes, 
+                                                        task="multiclass").cuda()
+            self.metric_seg_online = torchmetrics.JaccardIndex(num_classes=self.opt.n_classes + 1, 
+                                                               average="none", 
+                                                               ignore_index=self.opt.n_classes, 
+                                                               task="multiclass").cuda()
 
         if opt.dist:
             self.metric_seg = model_to_DDP(self.metric_seg, opt.gpu)
@@ -176,7 +194,8 @@ class TeSLA_Seg(object):
         ## logging
         logger.add(os.path.join(self.opt.experiment_dir, f"training_logs_rank{self.opt.rank}.log"))
 
-        self.train = self.train_volume if (self.opt.dataset_type == "med" and self.opt.n_epochs == 1) else self.train_image
+        self.train = self.train_image_source if self.opt.pretrain else (self.train_volume if (self.opt.dataset_type == "med" and self.opt.n_epochs == 1) else self.train_image)
+        # self.train = self.train_volume if (self.opt.dataset_type == "med" and self.opt.n_epochs == 1) else self.train_image
 
 
         if self.opt.n_epochs != 1:
@@ -460,7 +479,6 @@ class TeSLA_Seg(object):
 
 
 
-
     def train_image(self):
         """
         Code for training the test time policy networks on the target site.
@@ -588,6 +606,86 @@ class TeSLA_Seg(object):
             if self.opt.n_epochs != 1:
                 logger.info(f"Evaluating after {n_epochs} {n_iters} epochs on Test Set ...")
                 self.evaluate(self.ema_net, self.target_loader, n_epochs)
+
+            ## save model
+            self.save_model(n_epochs)
+            
+            # Next epoch
+            n_epochs +=1
+
+
+    def train_image_source(self):
+        """
+        Code for training the pre-trained source model.
+        """
+        logger.info("Training Pre-trained Source Network")
+        n_iters = 1
+        n_epochs = 1
+        max_iter = len(self.target_loader)*self.opt.n_epochs
+
+        self.weak_mult = self.opt.weak_mult
+
+        while n_epochs <= self.opt.n_epochs:
+            # Set epoch
+            if (n_epochs == 1 and self.opt.n_epochs != 1) :#or (self.opt.n_epochs == 1 and n_iters <= 60):
+                self.weak_mult = 1
+            else:
+                self.weak_mult = self.opt.weak_mult
+            if self.opt.dist:
+                self.target_loader.sampler.set_epoch(n_epochs)
+
+            self.hard_opt_aug.policy_predictor.reset_weights()            
+            self.metric_seg_online.reset()
+
+            for x, label, _, _ in self.target_loader:
+                ## apply lr scheduler
+                if self.opt.apply_lr_scheduler:
+                    self.lr_scheduler(self.optimizer_net, n_iters, max_iter)
+                
+                ## put current queue and labels on gpu
+                batch_x = x.cuda()
+                                
+                x_aug_hard = x_aug_hard.detach() # no gradients                
+
+                # make saved gradients zero
+                self.optimizer_net.zero_grad()
+
+                # accumulate gradients for no augmentations
+                pred_normal = F.softmax(self.net(batch_x)["out"], dim=1)
+                loss = self.cross_entropy_loss(pred_normal, label)
+                loss.mean().backward()
+
+                self.metric_tracker.update_metrics({
+                    "source": loss.mean().detach().cpu().item()
+                })
+
+                clip_gradient(self.optimizer_net)
+                
+                self.optimizer_net.step()
+
+                # batch evaluate
+                iou, avg = self.evaluate_batch(self.net, batch_x, label)
+
+                # print metrics on terminal
+                if n_iters % 20 == 0:
+                    loss_str = "%d>>>" % n_iters
+                    for k, v in self.metric_tracker.current_metrics().items():
+                        loss_str += " %s: %.3f" % (k, v)
+                    logger.info(loss_str)
+                
+                iou_str = ""
+                for item in iou:
+                    iou_str += " & %4.1f" % item
+                # print("Online eval: %s Avg: %4.1f" % (iou_str, avg))
+                logger.info("Online eval: %s Avg: %4.1f" % (iou_str, avg))
+
+                n_iters += 1
+            
+            # time.sleep(2)
+            # Offline Evaluation
+            # if self.opt.n_epochs != 1:
+            #     logger.info(f"Evaluating after {n_epochs} {n_iters} epochs on Test Set ...")
+            #     self.evaluate(self.ema_net, self.target_loader, n_epochs)
 
             ## save model
             self.save_model(n_epochs)

@@ -13,8 +13,9 @@ def get_opt_parser():
     parser.add_argument("--target_list_path", type=str, default="")
     parser.add_argument("--target_eval_list_path", type=str, default="")
     parser.add_argument("--target_input_size", default=[1024//2, 512//2])
-    
-    parser.add_argument("--pretrained_source_path", type=str, help="Path to the trained source model")
+    parser.add_argument("--pretrain", action="store_true", help="specify flag to pretrain the model on target dirs")
+
+    parser.add_argument("--pretrained_source_path", type=str, default=None, help="Path to the trained source model")
     parser.add_argument("--experiment_dir", type=str, help="Path to the experiment directory")
     
     parser.add_argument("--dataset_name", type=str)
